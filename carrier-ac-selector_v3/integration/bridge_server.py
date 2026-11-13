@@ -11,10 +11,14 @@ from .project_pipeline import inspect_project
 
 def _space_json(space: Any) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for name in ("room_id", "name", "area", "perimeter", "layer", "effective_layer"):
+    for name in ("room_id", "label", "name", "area", "perimeter", "layer", "effective_layer"):
         if hasattr(space, name):
             value = getattr(space, name)
             result[name] = value if isinstance(value, (str, int, float, bool, type(None))) else str(value)
+    # Keep a stable display name for clients while preserving the detector's
+    # original ``label`` field and its exact source spelling.
+    if "name" not in result and "label" in result:
+        result["name"] = result["label"]
     if not result:
         result["value"] = str(space)
     return result
