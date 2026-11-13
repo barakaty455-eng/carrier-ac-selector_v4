@@ -1,0 +1,605 @@
+/**
+ * Copyright (c) 2011-2018 by Andrew Mustun. All rights reserved.
+ *
+ * This file is part of the QCAD project.
+ *
+ * QCAD is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * QCAD is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with QCAD.
+ */
+
+/**
+ * Exports the given RDocument (doc) to a bitmap (BMP, PNG, JPEG, TIFF, ...).
+ * \param doc RDocument document
+ * \param scene Graphics scene to export (e.g. RGraphicsSceneQt, RGraphicsSceneRhi3D)
+ * \param fileName File name for exported bitmap. Extension determines format.
+ * \param properties Various properties:
+ *
+ *  - properties["width"]: width of bitmap in pixels (ignored if resolution is present)
+ *  - properties["height"]: height of bitmap in pixels (ignored if resolution is present)
+ *  - properties["resolution"]: resolution in pixels / drawing unit (also
+ *    stored as physical resolution / DPI of the image, see
+ *    \ref setBitmapResolution)
+ *  - properties["margin"]: margin at borders in pixels
+ *  - properties["noWeightMargin"]: true to disable margin for lineweight, defaults to false
+ *  - properties["backgroundColor"]: background color (RColor)
+ *  - properties["origin"]: true: export origin point as red cross
+ *  - properties["antialiasing"]: true: use antialiasing
+ *  - properties["quality"]: Export quality (0..100), JPEG only
+ *  - properties["monochrome"]: true: Export as black / white
+ *  - properties["grayscale"]: true: Export as grayscale
+ *  - properties["window"]: RBox: window to export in drawing coordinates
+ *  - properties["entityIds"]: Array: zoom to bounding box of given entities
+ *  - properties["initView"]: Callback to initialize view
+ *  - properties["zoomAll"]: Auto zoom to all entities, including those on invisible layers
+ *  - properties["metaData"]: Key / value pairs of meta data to write to image header
+ *  - properties["colorCorrection"]: explicitely enable / disable color correction
+ *
+ * \param view Optional graphics view to use.
+ *
+ * An image based scene (RGraphicsSceneQt) is rendered into an image by an
+ * image based view (RGraphicsViewImage). An RHI based scene
+ * (RGraphicsSceneRhi3D) exports its entities into the view it is attached
+ * to (i.e. onto the GPU) and cannot be rendered by an image based view:
+ * the rendered frame is read back from the RHI based view instead (see
+ * \ref renderBitmapRhi), or the document is rendered through a temporary
+ * off screen image based view if the RHI based view cannot render the
+ * requested size (see \ref renderBitmapImageOffScreen).
+ */
+function exportBitmap(doc, scene, fileName, properties, view) {
+    var ret;
+
+    initBitmapProperties(doc, properties);
+
+    if (properties["width"] * properties["height"] > 2147483647/4) {
+        qDebug("invalid image size");
+        return [ false, qsTr("Invalid image size (width x height must be less than %1)").arg(536870911) ];
+    }
+
+    var buffer;
+
+    var rhiView = getRhiViewOfScene(scene, view);
+    if (!isNull(rhiView)) {
+        // RHI based scene (RGraphicsSceneRhi3D):
+        buffer = renderBitmapRhi(doc, scene, properties, rhiView);
+    }
+    else {
+        // image based scene (RGraphicsSceneQt):
+        buffer = renderBitmapImage(doc, scene, properties, view);
+    }
+
+    if (isNull(buffer) || buffer.isNull()) {
+        qDebug("cannot render image");
+        return [ false, qsTr("Cannot render image") ];
+    }
+
+    setBitmapResolution(doc, buffer, properties);
+
+    var iw = new QImageWriter(fileName);
+    var ext = new QFileInfo(fileName).suffix().toLowerCase();
+    if (ext === "png") {
+        iw.setQuality(9);
+    } else if (ext === "jpg" || ext === "jpeg") {
+        iw.setQuality(properties["quality"]==null ? 100 : properties["quality"]);
+    } else if (ext === "tif" || ext === "tiff") {
+        iw.setCompression(1);
+    } else if (ext === "bmp") {
+        iw.setCompression(1);
+    }
+
+    if (isArray(properties["metaData"])) {
+        for (var i=0; i<properties["metaData"].length; i++) {
+            // meta data:
+            iw.setText(properties["metaData"][0], properties["metaData"][1]);
+        }
+    }
+
+    if (!iw.write(buffer)) {
+        ret = [false, iw.errorString()];
+    } else {
+        ret = [true, ""];
+    }
+    destr(iw);
+
+    return ret;
+}
+
+/**
+ * Initializes the properties which are used by all views: applies the
+ * defaults and converts a resolution into the size of the image.
+ */
+function initBitmapProperties(doc, properties) {
+    if (typeof(properties["margin"])==="undefined") {
+        properties["margin"] = 20;
+    }
+
+    if (typeof(properties["noWeightMargin"])==="undefined") {
+        properties["noWeightMargin"] = false;
+    }
+
+    if (typeof(properties["zoomAll"])==="undefined") {
+        properties["zoomAll"] = false;
+    }
+
+    if (properties["resolution"]) {
+        var bb;
+        if (typeof(properties["entityIds"])!=="undefined") {
+            bb = doc.getEntitiesBox(properties["entityIds"]);
+        }
+        else {
+            bb = doc.getBoundingBox(true, true);
+        }
+
+        if (properties["noWeightMargin"]===false) {
+            // grow bounding box by max line weight:
+            var wm = RUnit.convert(doc.getMaxLineweight()/100.0/2, RS.Millimeter, doc.getUnit());
+            bb.growXY(wm);
+        }
+
+        properties["width"] = Math.ceil(bb.getWidth() * properties["resolution"] + 2 * properties["margin"]);
+        properties["height"] = Math.ceil(bb.getHeight() * properties["resolution"] + 2 * properties["margin"]);
+    }
+
+    if (!properties["width"]) {
+        properties["width"] = 640;
+    }
+    if (!properties["height"]) {
+        properties["height"] = 480;
+    }
+}
+
+/**
+ * Stores the physical resolution of the exported image (dots per meter,
+ * written as DPI / pixels per meter into the header of PNG, JPEG, BMP and
+ * TIFF files) if the image is exported with a fixed resolution in pixels /
+ * drawing unit for a drawing with a physical unit. Without this, the
+ * image has the default resolution of Qt (96 DPI) and applications which
+ * print or place the image (word processors, image editors) scale it to
+ * that resolution instead of the resolution it was exported with: e.g. 600
+ * DPI for 23.622 pixels / millimeter (600 / 25.4).
+ *
+ * \param buffer QImage to export.
+ */
+function setBitmapResolution(doc, buffer, properties) {
+    if (!properties["resolution"]) {
+        return;
+    }
+
+    var unit = doc.getUnit();
+    if (unit===RS.None) {
+        // drawing unit has no physical size:
+        return;
+    }
+
+    // meters per drawing unit:
+    var meters = RUnit.convert(1.0, unit, RS.Meter);
+    if (!isNumber(meters) || !isFinite(meters) || meters<=0.0) {
+        return;
+    }
+
+    var dpm = Math.round(properties["resolution"] / meters);
+    // QImage stores dots per meter as int:
+    if (!isFinite(dpm) || dpm<1 || dpm>2147483647) {
+        return;
+    }
+
+    buffer.setDotsPerMeterX(dpm);
+    buffer.setDotsPerMeterY(dpm);
+}
+
+/**
+ * Zooms the given view (RGraphicsView) to the area which is exported
+ * (window, entities, bounding box of the drawing).
+ *
+ * \param margin Margin at the borders in the pixel unit of the view.
+ */
+function zoomBitmapView(doc, view, properties, margin) {
+    // remember the box we zoom to, so we can re-center on it below when a
+    // fixed resolution is used:
+    var zoomBox;
+    if (properties["window"]) {
+        zoomBox = properties["window"];
+        view.zoomTo(zoomBox, margin);
+    }
+    else if (properties["zoomAll"]) {
+        zoomBox = doc.getBoundingBox(false, true);
+        view.zoomTo(zoomBox, margin);
+    }
+    else if (typeof(properties["entityIds"])!=="undefined") {
+        zoomBox = doc.getEntitiesBox(properties["entityIds"]);
+        view.zoomToEntities(properties["entityIds"], margin);
+    }
+    else {
+        zoomBox = doc.getBoundingBox(true, true);
+        view.autoZoom(margin, true, properties["noWeightMargin"]);
+    }
+
+    // make sure we use the desired resolution:
+    // auto zoom might be slightly off, due to rounding canvas to pixels:
+    if (properties["resolution"]) {
+        view.setFactor(properties["resolution"]);
+        // setFactor() changes the zoom factor but keeps the offset that
+        // zoomTo() computed for its own (margin adjusted) factor. That leaves
+        // the drawing off-center, putting the whole margin on one side and
+        // pushing the opposite side out of the image. Re-center on the
+        // exported box so the margin is distributed evenly on all sides:
+        if (!isNull(zoomBox) && zoomBox.isValid()) {
+            view.centerToBox(zoomBox);
+        }
+    }
+}
+
+/**
+ * Renders the given image based scene (RGraphicsSceneQt) into an image.
+ *
+ * \param view Optional image based view (RGraphicsViewImage) to use. A
+ * temporary view is created and attached to the scene if no view is given.
+ *
+ * \return QImage or undefined.
+ */
+function renderBitmapImage(doc, scene, properties, view) {
+    var viewCreated = false;
+    if (isNull(view)) {
+        view = new RGraphicsViewImage();
+        view.setScene(scene, false);
+        viewCreated = true;
+    }
+    var numThreadsOri = view.getNumThreads();
+
+    var antialiasing = (properties["antialiasing"]==null ? true : properties["antialiasing"]);
+
+    // crashes with multiple threads:
+    view.setNumThreads(1);
+    view.setAlphaEnabled(true);
+
+    view.setPaintOrigin(properties["origin"]==null ? false : properties["origin"]);
+    if (typeof(properties["textHeightThreshold"])!=="undefined") {
+        view.setTextHeightThresholdOverride(properties["textHeightThreshold"]);
+        view.setForceTextHeightThreshold(true);
+    }
+    else {
+        view.setTextHeightThresholdOverride(0);
+    }
+
+    view.setAntialiasing(antialiasing);
+
+    if (properties["monochrome"]===true) {
+        view.setColorMode(RGraphicsView.BlackWhite);
+    }
+    else if (properties["grayscale"]===true) {
+        view.setColorMode(RGraphicsView.GrayScale);
+    }
+
+    if (properties["backgroundColor"]) {
+        view.setBackgroundColor(properties["backgroundColor"]);
+    }
+
+    if (typeof(properties["colorCorrection"])!=="undefined") {
+        view.setColorCorrectionOverride(properties["colorCorrection"]);
+    }
+
+    view.resizeImage(properties["width"], properties["height"]);
+
+    zoomBitmapView(doc, view, properties, properties["margin"]);
+
+    view.clear();
+    view.setExporting(true);
+    view.setHairlineMinimumMode(true);
+
+    if (properties["regen"]!==false) {
+        scene.regenerate();
+    }
+
+    view.updateImage();
+
+    if (isFunction(properties["initView"])) {
+        properties["initView"](view);
+    }
+
+    var buffer = view.getBuffer();
+
+    if (properties["monochrome"]===true && !antialiasing) {
+        buffer = buffer.convertToFormat(QImage.Format_Mono);
+    }
+
+    view.setNumThreads(numThreadsOri);
+    if (viewCreated) {
+        scene.unregisterView(view);
+        // deleting a view which is still attached to a scene makes the
+        // document interface delete that scene if no other view uses it
+        // (RDocumentInterface::deleteScenesWithoutViews): detach the
+        // temporary view from the scene of the caller first, or the
+        // caller is left with a deleted scene:
+        view.setScene(null, false);
+        destr(view);
+    }
+
+    return buffer;
+}
+
+/**
+ * Renders the given RHI based scene (RGraphicsSceneRhi3D) by reading the
+ * frame rendered by the given RHI based view back from the GPU.
+ *
+ * The view is displayed on screen and typically managed by a layout
+ * (resizing it to the exported size is not possible): it renders into a
+ * color buffer of the exported size instead (a texture on the GPU, see
+ * RGraphicsViewRhi3D::setExportSize) while it keeps its geometry on
+ * screen. One pixel of that color buffer is one (device independent)
+ * pixel of the view during the export, so the rendered frame has
+ * exactly the exported size and the exported area is the same as for an
+ * image based view of that size.
+ *
+ * Images which are larger than the maximum texture size of the GPU
+ * cannot be rendered by the RHI based view: they are rendered by a
+ * temporary off screen image based view instead (see
+ * \ref renderBitmapImageOffScreen), which is also used as a fallback if
+ * the frame cannot be rendered at all.
+ *
+ * Options which are implemented by the image based view only (paint
+ * origin, text height threshold, number of threads) are not available.
+ * A background color with alpha is honored: the frame is cleared with
+ * it (see RGraphicsViewRhi3D::render) and read back with its alpha
+ * channel, so a transparent background color exports an image with a
+ * transparent background (like the image based view with alpha
+ * enabled). Antialiasing is supported by 2D views only (3D views are
+ * always anti-aliased). The color modes (monochrome, grayscale) are
+ * applied to the rendered image.
+ *
+ * The grid and the decorations (origin, crosshair, reference points, snap
+ * label) are not rendered while the view is exporting. The colors of the
+ * entities are resolved when they are exported into the view however:
+ * selected entities are rendered in the selection color (deselect before
+ * exporting, as BitmapExport does).
+ *
+ * \param rhiView RGraphicsViewRhi3D (in 2D or 3D mode).
+ *
+ * \return QImage or undefined.
+ */
+function renderBitmapRhi(doc, scene, properties, rhiView) {
+    // the frame is rendered into a texture on the GPU: images which are
+    // larger than the maximum texture size are rendered by an image
+    // based view (which renders into an image of arbitrary size):
+    var maxSize = rhiView.getMaxExportSize();
+    if (maxSize>0 &&
+        (properties["width"]>maxSize || properties["height"]>maxSize)) {
+
+        qDebug("bitmap export: image is larger than the maximum texture size (" +
+               maxSize + "): using an image based view");
+        return renderBitmapImageOffScreen(doc, scene, properties);
+    }
+
+    // the RGraphicsView interface of the view (navigation, zooming):
+    // owned by the view, views in 2D mode only (a view in 3D mode
+    // renders the drawing as seen by its camera):
+    var view = undefined;
+    if (isFunction(rhiView.getRGraphicsView) && !rhiView.is3DView()) {
+        view = rhiView.getRGraphicsView();
+    }
+
+    // the view is displayed on screen: remember its state to restore it
+    // after the export:
+    var oriFactor, oriOffset, oriBackgroundColor, oriExporting, oriHairlineMinimumMode;
+    var oriHasColorCorrection, oriColorCorrection, oriAntialiasing;
+    if (!isNull(view)) {
+        oriFactor = view.getFactor();
+        oriAntialiasing = view.getAntialiasing();
+        oriOffset = view.getOffset();
+        oriBackgroundColor = view.getBackgroundColor();
+        oriExporting = view.isExporting();
+        oriHairlineMinimumMode = view.getHairlineMinimumMode();
+        // the override is tri-state (none, on, off): getColorCorrectionOverride
+        // reports true if there is no override:
+        oriHasColorCorrection = rhiView.hasColorCorrectionOverride();
+        oriColorCorrection = rhiView.getColorCorrectionOverride();
+    }
+
+    // the anti-aliasing flag of the view also sets the number of samples
+    // of the color buffer (see RGraphicsViewRhi3D::getEffectiveSampleCount):
+    // set it before the export size:
+    if (!isNull(view)) {
+        view.setAntialiasing(properties["antialiasing"]==null ? true : properties["antialiasing"]);
+    }
+
+    // the zoom depends on the size of the view: switch to the exported
+    // size first (the view reports it as its size while it renders into
+    // the color buffer of that size):
+    rhiView.setExportSize(properties["width"], properties["height"]);
+
+    if (!isNull(view)) {
+        if (properties["backgroundColor"]) {
+            view.setBackgroundColor(properties["backgroundColor"]);
+        }
+
+        if (typeof(properties["colorCorrection"])!=="undefined") {
+            rhiView.setColorCorrectionOverride(properties["colorCorrection"]);
+        }
+
+        view.setExporting(true);
+        view.setHairlineMinimumMode(true);
+
+        zoomBitmapView(doc, view, properties, properties["margin"]);
+    }
+
+    // the colors of the entities of an RHI based scene are resolved at
+    // export time (color correction, background color): always regenerate
+    // if the colors might have changed:
+    if (properties["regen"]!==false ||
+        properties["backgroundColor"] ||
+        typeof(properties["colorCorrection"])!=="undefined") {
+
+        scene.regenerate();
+    }
+    QCoreApplication.processEvents();
+
+    if (isFunction(properties["initView"])) {
+        properties["initView"](isNull(view) ? rhiView : view);
+    }
+
+    // render a frame into the color buffer of the exported size and read
+    // it back from the GPU (QWidget.grab cannot be used: it renders the
+    // color buffer into an image of the size of the widget):
+    var buffer = rhiView.grabFramebuffer();
+
+    // the pipelines of the RHI based views render with premultiplied
+    // alpha (see the blend states in RGraphicsViewRhi3D), but
+    // QRhiWidget::grabFramebuffer tags the image as QImage.Format_RGBA8888
+    // (straight alpha): reinterpret the image so that the pixels on a
+    // translucent background (transparent background color) are
+    // converted and saved correctly. Opaque pixels are the same in both
+    // formats:
+    if (!isNull(buffer) && !buffer.isNull() && buffer.format()===QImage.Format_RGBA8888) {
+        buffer.reinterpretAsFormat(QImage.Format_RGBA8888_Premultiplied);
+    }
+
+    // restore the state of the view:
+    if (!isNull(view)) {
+        view.setAntialiasing(oriAntialiasing);
+    }
+    rhiView.resetExportSize();
+    if (!isNull(view)) {
+        view.setExporting(oriExporting);
+        view.setHairlineMinimumMode(oriHairlineMinimumMode);
+        if (properties["backgroundColor"]) {
+            view.setBackgroundColor(oriBackgroundColor);
+        }
+        if (typeof(properties["colorCorrection"])!=="undefined") {
+            if (oriHasColorCorrection) {
+                rhiView.setColorCorrectionOverride(oriColorCorrection);
+            }
+            else {
+                rhiView.resetColorCorrectionOverride();
+            }
+        }
+        rhiView.setOffset(oriOffset);
+        rhiView.setFactor(oriFactor);
+    }
+    scene.regenerate();
+    QCoreApplication.processEvents();
+
+    if (isNull(buffer) || buffer.isNull()) {
+        // the frame could not be rendered (e.g. the color buffer exceeds
+        // the limits of the GPU): fall back to an image based view:
+        qDebug("bitmap export: cannot render frame: using an image based view");
+        return renderBitmapImageOffScreen(doc, scene, properties);
+    }
+
+    // the color buffer has the exported size, this should never happen:
+    if (buffer.width()!==properties["width"] || buffer.height()!==properties["height"]) {
+        qWarning("bitmap export: unexpected frame size: " +
+                 buffer.width() + "x" + buffer.height());
+        buffer = buffer.scaled(properties["width"], properties["height"],
+                               Qt.IgnoreAspectRatio, Qt.SmoothTransformation);
+    }
+
+    // RHI based views do not implement the color modes of the image based
+    // view: convert the rendered image:
+    if (properties["monochrome"]===true) {
+        buffer = buffer.convertToFormat(QImage.Format_Mono);
+    }
+    else if (properties["grayscale"]===true) {
+        buffer = buffer.convertToFormat(QImage.Format_Grayscale8);
+    }
+
+    return buffer;
+}
+
+/**
+ * Renders the scene of the document of the given scene through a
+ * temporary off screen image based view (RGraphicsSceneQt /
+ * RGraphicsViewImage), for exports which the RHI based view cannot
+ * render (see \ref renderBitmapRhi). The image based view renders into
+ * an image of arbitrary size on the CPU.
+ *
+ * \return QImage or undefined.
+ */
+function renderBitmapImageOffScreen(doc, scene, properties) {
+    var di = scene.getDocumentInterface();
+    var imageScene = new RGraphicsSceneQt(di);
+    var imageView = new RGraphicsViewImage();
+    imageView.setScene(imageScene, false);
+
+    // the entities are exported into the new scene (which is empty):
+    properties["regen"] = true;
+
+    var buffer = renderBitmapImage(doc, imageScene, properties, imageView);
+
+    // the image based view is owned by its creator
+    // (RGraphicsViewImage::isShared): deleting the scene unregisters it
+    // from the document interface and detaches the view, which is
+    // deleted after that (deleting the view first would make the
+    // document interface delete the scene, see
+    // RDocumentInterface::deleteScenesWithoutViews):
+    destr(imageScene);
+    destr(imageView);
+
+    return buffer;
+}
+
+/**
+ * \return The RHI based view (RGraphicsViewRhi3D)
+ * which renders the given scene or undefined if the given scene is
+ * rendered by an image based view (RGraphicsSceneQt / RGraphicsViewImage)
+ * or if RHI based views are not available (RHI3D plugin not installed).
+ *
+ * Note that the scene returned by RGraphicsView.getScene is always an
+ * RGraphicsScene for an RHI based view (the script wrapper of the scene
+ * of a plugin is not created for a pointer returned by a core class):
+ * such a scene is detected through the views which are registered with
+ * it (an RHI based 2D view registers the RGraphicsView adapter it owns).
+ *
+ * \param scene Graphics scene (RGraphicsSceneQt, RGraphicsSceneRhi3D, ...).
+ * \param view Optional graphics view: the RHI based view itself or the
+ * RGraphicsView adapter it owns.
+ */
+function getRhiViewOfScene(scene, view) {
+    if (typeof(RGraphicsViewRhi3D)==="undefined") {
+        // RHI3D plugin not available:
+        return undefined;
+    }
+
+    var rhiView;
+
+    if (!isNull(view)) {
+        // the given view is the RHI based view itself:
+        if (isOfType(view, RGraphicsViewRhi3D)) {
+            return view;
+        }
+
+        // the given view is the adapter owned by an RHI based view:
+        rhiView = RGraphicsViewRhi3D.getViewOf(view);
+        if (!isNull(rhiView)) {
+            return rhiView;
+        }
+    }
+
+    // the scene is known to be an RHI based scene (e.g. created by the
+    // caller of exportBitmap):
+    if (isOfType(scene, RGraphicsSceneRhi3D)) {
+        rhiView = scene.getView();
+        if (!isNull(rhiView)) {
+            return rhiView;
+        }
+    }
+
+    // one of the views registered with the scene is the adapter of an RHI
+    // based view:
+    var views = scene.getGraphicsViews();
+    for (var i=0; i<views.length; i++) {
+        rhiView = RGraphicsViewRhi3D.getViewOf(views[i]);
+        if (!isNull(rhiView)) {
+            return rhiView;
+        }
+    }
+
+    return undefined;
+}

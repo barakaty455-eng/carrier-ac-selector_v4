@@ -1,0 +1,169 @@
+name: Publish Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate release version
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw "Release tag must use SemVer format vMAJOR.MINOR.PATCH: $tag"
+          }
+          $versionText = Get-Content -Raw version.py
+          $match = [regex]::Match($versionText, 'APP_VERSION\s*=\s*["'']([^"'']+)["'']')
+          if (-not $match.Success) { throw "APP_VERSION was not found in version.py" }
+          $version = $match.Groups[1].Value
+          if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+            throw "APP_VERSION is not valid SemVer: $version"
+          }
+          if ($tag -ne "v$version") {
+            throw "Tag $tag does not match APP_VERSION $version"
+          }
+
+      - name: Run release preflight tests
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements-dev.txt
+          if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }
+          $packageDirs = @("cad", "engineering", "equipment", "hap", "reports", "ui")
+          $files = @(Get-ChildItem -Path $packageDirs -Filter *.py -File -Recurse |
+            ForEach-Object { $_.FullName })
+          python -m py_compile core.py main.py electrical_engine.py ocr_engine.py roi_tab.py room_review_dialog.py updater.py version.py $files
+          if ($LASTEXITCODE -ne 0) { throw "Python compilation failed." }
+          python -m pytest -q
+          if ($LASTEXITCODE -ne 0) { throw "Tests failed; refusing to publish this release." }
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/apply_update.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List
+            throw "PowerShell updater syntax validation failed."
+          }
+          $stage = Join-Path $env:RUNNER_TEMP "carrier-updater-validation"
+          New-Item -ItemType Directory -Path (Join-Path $stage "data") -Force | Out-Null
+          $required = @("main.py", "core.py", "requirements.txt", "room_review_dialog.py", "updater.py", "version.py", "apply_update.ps1")
+          foreach ($name in $required) {
+            Set-Content -LiteralPath (Join-Path $stage $name) -Value "# validation fixture"
+          }
+          Set-Content -LiteralPath (Join-Path $stage "data/Carrier_AC_Database.xlsx") -Value "fixture"
+          $packages = @{
+            "cad" = @("__init__.py", "block_manager.py", "dxf_exporter.py", "dxf_reader.py", "importer.py", "layer_analyzer.py", "layer_manager.py", "room_matching.py", "room_review.py", "schedule_builder.py", "space_detector.py", "tag_config.py", "workflow.py")
+            "engineering" = @("__init__.py", "units.py")
+            "equipment" = @("__init__.py", "best_pick.py", "catalog_reader.py", "indoor_selector.py")
+            "hap" = @("__init__.py", "parser.py")
+            "reports" = @("__init__.py", "electrical_report.py", "excel_export.py", "export_frames.py", "file_io.py")
+            "ui" = @("__init__.py", "cad_workspace.py", "layout.py", "selection_workspace.py")
+          }
+          foreach ($package in $packages.Keys) {
+            New-Item -ItemType Directory -Path (Join-Path $stage $package) -Force | Out-Null
+            foreach ($name in $packages[$package]) {
+              Set-Content -LiteralPath (Join-Path $stage "$package/$name") -Value "# validation fixture"
+            }
+          }
+          $validationZip = Join-Path $env:RUNNER_TEMP "carrier-updater-validation.zip"
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $validationZip -Force
+          & "$PWD/apply_update.ps1" -Archive $validationZip -TargetDir "$PWD" -WaitPid -1 -ValidateOnly
+          if ($LASTEXITCODE -ne 0) { throw "Windows update archive validation smoke test failed." }
+
+      - name: Build Windows update package
+        shell: pwsh
+        run: |
+          $files = @(
+            "main.py", "core.py", "ocr_engine.py", "electrical_engine.py",
+            "room_review_dialog.py",
+            "roi_tab.py", "updater.py", "version.py", "apply_update.ps1",
+            "Start_Carrier.bat", "setup.ps1", "run.ps1", "test.ps1",
+            "requirements.txt", "requirements-dev.txt", "README.md"
+          )
+          $stage = Join-Path $env:RUNNER_TEMP "carrier-release"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          foreach ($file in $files) {
+            if (-not (Test-Path $file -PathType Leaf)) {
+              throw "Missing release file: $file"
+            }
+            Copy-Item -LiteralPath $file -Destination $stage
+          }
+          if (-not (Test-Path "data" -PathType Container)) {
+            throw "The application data directory is missing."
+          }
+          Copy-Item -LiteralPath "data" -Destination (Join-Path $stage "data") -Recurse
+          $packages = @{
+            "cad" = @("__init__.py", "block_manager.py", "dxf_exporter.py", "dxf_reader.py", "importer.py", "layer_analyzer.py", "layer_manager.py", "room_matching.py", "room_review.py", "schedule_builder.py", "space_detector.py", "tag_config.py", "workflow.py")
+            "engineering" = @("__init__.py", "units.py")
+            "equipment" = @("__init__.py", "best_pick.py", "catalog_reader.py", "indoor_selector.py")
+            "hap" = @("__init__.py", "parser.py")
+            "reports" = @("__init__.py", "electrical_report.py", "excel_export.py", "export_frames.py", "file_io.py")
+            "ui" = @("__init__.py", "cad_workspace.py", "layout.py", "selection_workspace.py")
+          }
+          foreach ($package in $packages.Keys) {
+            $packageStage = Join-Path $stage $package
+            New-Item -ItemType Directory -Path $packageStage -Force | Out-Null
+            foreach ($name in $packages[$package]) {
+              $source = Join-Path $package $name
+              if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                throw "Missing application package file: $source"
+              }
+              Copy-Item -LiteralPath $source -Destination $packageStage
+            }
+          }
+          $archive = Join-Path $PWD "CarrierACSelector-Windows.zip"
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $archive -CompressionLevel Optimal
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  CarrierACSelector-Windows.zip" | Set-Content -Path (Join-Path $PWD "SHA256SUMS.txt") -Encoding ascii
+
+      - name: Test fresh v2.0.1 install and real in-place update
+        shell: pwsh
+        run: |
+          $packageDirs = @("cad", "engineering", "equipment", "hap", "reports", "ui")
+          Write-Host "Testing the modular package install and in-place update."
+          $migration = Join-Path $env:RUNNER_TEMP "carrier-update-install"
+          New-Item -ItemType Directory -Path $migration -Force | Out-Null
+          $releaseStage = Join-Path $env:RUNNER_TEMP "carrier-release"
+          Copy-Item -Path (Join-Path $releaseStage "*") -Destination $migration -Recurse -Force
+          Push-Location $migration
+          try {
+            & .\setup.ps1
+            if ($LASTEXITCODE -ne 0) { throw "Fresh Windows installation failed." }
+          } finally {
+            Pop-Location
+          }
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $downloadDir = Join-Path $env:RUNNER_TEMP "carrier-update-download"
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+          $upgradeArchive = Join-Path $downloadDir "CarrierACSelector-Windows.zip"
+          Copy-Item -LiteralPath (Join-Path $PWD "CarrierACSelector-Windows.zip") -Destination $upgradeArchive
+          & (Join-Path $migration "apply_update.ps1") -Archive $upgradeArchive -TargetDir $migration -WaitPid -1 -Restart
+          if ($LASTEXITCODE -ne 0) { throw "The updater failed to apply the release package." }
+          $updatedPython = Join-Path $migration ".venv\Scripts\python.exe"
+          $importModules = @("main", "core", "updater") + $packageDirs
+          $importStatement = "import " + ($importModules -join ", ") + "; from version import APP_VERSION; print(APP_VERSION)"
+          & $updatedPython -c $importStatement
+          if ($LASTEXITCODE -ne 0) { throw "Updated install could not import the application packages." }
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            CarrierACSelector-Windows.zip
+            SHA256SUMS.txt
